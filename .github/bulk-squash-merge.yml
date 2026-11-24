@@ -1,0 +1,119 @@
+
+name: Bulk Squash Merge PRs
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_numbers:
+        description: "PR numbers separated by commas (example: 12,13,14)"
+        required: true
+        type: string
+      confirm:
+        description: "Confirm that these PRs should be squash-merged into develop"
+        required: true
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate:
+    name: Validate selected PRs
+    runs-on: ubuntu-latest
+
+    if: inputs.confirm == true
+
+    steps:
+      - name: Validate all PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_INPUT: ${{ inputs.pr_numbers }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IFS=',' read -ra PRS <<< "$PR_INPUT"
+
+          if [ "${#PRS[@]}" -eq 0 ]; then
+            echo "No PRs supplied."
+            exit 1
+          fi
+
+          declare -A SEEN
+
+          for raw in "${PRS[@]}"; do
+            pr="$(echo "$raw" | xargs)"
+
+            [[ "$pr" =~ ^[0-9]+$ ]] || {
+              echo "Invalid PR number: $pr"
+              exit 1
+            }
+
+            [[ -z "${SEEN[$pr]:-}" ]] || {
+              echo "Duplicate PR: $pr"
+              exit 1
+            }
+            SEEN[$pr]=1
+
+            data=$(gh pr view "$pr" --repo "$REPO" \
+              --json state,baseRefName,isDraft,mergeable)
+
+            state=$(jq -r '.state' <<< "$data")
+            base=$(jq -r '.baseRefName' <<< "$data")
+            draft=$(jq -r '.isDraft' <<< "$data")
+            mergeable=$(jq -r '.mergeable' <<< "$data")
+
+            if [[ "$state" != "OPEN" ||
+                  "$base" != "develop" ||
+                  "$draft" == "true" ||
+                  "$mergeable" != "MERGEABLE" ]]; then
+              echo "PR #$pr failed validation: $data"
+              exit 1
+            fi
+
+            echo "PR #$pr passed validation."
+          done
+
+  merge:
+    name: Approved bulk squash merge
+    needs: validate
+    runs-on: ubuntu-latest
+
+    environment: bulk-merge-approval
+
+    steps:
+      - name: Squash merge PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_INPUT: ${{ inputs.pr_numbers }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IFS=',' read -ra PRS <<< "$PR_INPUT"
+
+          for raw in "${PRS[@]}"; do
+            pr="$(echo "$raw" | xargs)"
+
+            echo "Rechecking PR #$pr..."
+
+            data=$(gh pr view "$pr" --repo "$REPO" \
+              --json state,baseRefName,isDraft,mergeable)
+
+            [[ "$(jq -r '.state' <<< "$data")" == "OPEN" ]]
+            [[ "$(jq -r '.baseRefName' <<< "$data")" == "develop" ]]
+            [[ "$(jq -r '.isDraft' <<< "$data")" == "false" ]]
+            [[ "$(jq -r '.mergeable' <<< "$data")" == "MERGEABLE" ]]
+
+            echo "Squash merging PR #$pr..."
+
+            gh pr merge "$pr" \
+              --repo "$REPO" \
+              --squash \
+              --delete-branch
+
+            echo "Successfully merged PR #$pr."
+          done
